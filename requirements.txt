@@ -1,0 +1,7 @@
+# Development dependencies
+pytest==7.4.3
+pytest-cov==4.1.0
+
+# Common utilities
+requests==2.31.0
+python-dotenv==1.0.0
