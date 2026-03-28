@@ -1,7 +1,10 @@
-# Development dependencies
-pytest==7.4.3
-pytest-cov==4.1.0
-
-# Common utilities
+# Runtime packages
 requests==2.31.0
 python-dotenv==1.0.0
+
+# Dev and quality tools
+pytest==7.4.3
+pytest-cov==4.1.0
+mypy==1.18.2
+ruff==0.13.2
+types-requests==2.32.4.20250913

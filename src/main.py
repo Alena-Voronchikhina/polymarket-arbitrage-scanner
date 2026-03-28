@@ -1,143 +1,235 @@
-import requests
-import json
-import time
+"""Poll Polymarket every 30 seconds for potential mispricing.
+
+If the C++ extension is available, this module uses it for the pricing check.
+If not, it falls back to pure Python.
+
+Build the extension with:
+  cd cpp/build && cmake .. -DCMAKE_BUILD_TYPE=Release && cmake --build . --parallel
+  cp arbitrage_engine*.so ../../src/
+"""
+
 import csv
-from datetime import datetime
+import importlib
+import json
 import os
+import time
+from datetime import datetime, timezone
+from typing import Any, Final, TypeAlias, TypedDict
+
+import requests
 
 
-def load_logged_entries(file_path="opportunities.csv"):
-    entries = set()
+class Opportunity(TypedDict):
+    """Fields recorded for one flagged market."""
 
+    question: str
+    prices: list[float]
+    price_sum: float
+    spread: float
+
+
+LogKey: TypeAlias = tuple[str, tuple[float, ...], float, float]
+MarketJSON: TypeAlias = dict[str, Any]
+
+
+_API_URL: Final[str] = "https://gamma-api.polymarket.com/events?active=true&closed=false&limit=100"
+_LOG_PATH: Final[str] = "opportunities.csv"
+_POLL_PERIOD: Final[int] = 30
+_THRESHOLD: Final[float] = 0.02
+
+_ae: Any = None
+_engine: Any = None
+_USE_CPP: bool = False
+
+try:
+    _ae = importlib.import_module("arbitrage_engine")
+    _engine = _ae.ArbitrageEngine(threshold=_THRESHOLD)
+    _USE_CPP = True
+    print("[backend] C++ ArbitrageEngine loaded (Kahan-based check active).")
+except ModuleNotFoundError:
+    print("[backend] C++ module not found; using Python fallback.")
+
+
+def _parse_outcome_prices(raw_prices: Any) -> list[float] | None:
+    """Parse API outcome prices into a clean list of floats."""
+    if isinstance(raw_prices, str):
+        try:
+            raw_values = json.loads(raw_prices)
+        except json.JSONDecodeError:
+            return None
+    elif isinstance(raw_prices, list):
+        raw_values = raw_prices
+    else:
+        return None
+
+    if not isinstance(raw_values, list):
+        return None
+
+    parsed: list[float] = []
+    for value in raw_values:
+        if not value:
+            continue
+        try:
+            parsed.append(float(value))
+        except (TypeError, ValueError):
+            return None
+    return parsed
+
+
+def _detect_mispricing_python(
+    question: str, prices: list[float], threshold: float = 0.02
+) -> Opportunity | None:
+    """Fallback mispricing check using Python sum()."""
+    if len(prices) < 2:
+        return None
+
+    total = sum(prices)
+    if abs(total - 1.0) <= threshold:
+        return None
+
+    return {
+        "question": question,
+        "prices": prices,
+        "price_sum": total,
+        "spread": max(prices) - min(prices),
+    }
+
+
+def detect_opportunity(question: str, prices: list[float]) -> Opportunity | None:
+    """Use C++ when available, otherwise run the Python fallback."""
+    if _USE_CPP:
+        market = _ae.Market(question, prices)
+        opp = _engine.evaluate(market)
+        if opp is None:
+            return None
+
+        return {
+            "question": opp.question,
+            "prices": opp.prices,
+            "price_sum": opp.price_sum,
+            "spread": opp.spread,
+        }
+
+    return _detect_mispricing_python(question, prices)
+
+
+def _make_log_key(question: str, prices: list[float], price_sum: float, spread: float) -> LogKey:
+    """Build a rounded key for CSV deduplication."""
+    return (
+        question,
+        tuple(round(p, 6) for p in prices),
+        round(price_sum, 6),
+        round(spread, 6),
+    )
+
+
+def load_logged_entries(file_path: str = _LOG_PATH) -> set[LogKey]:
+    """Read existing CSV rows and rebuild the deduplication key set."""
+    entries: set[LogKey] = set()
     if not os.path.exists(file_path):
         return entries
 
     try:
-        with open(file_path, mode="r", newline="", encoding="utf-8") as csv_file:
-            reader = csv.DictReader(csv_file)
-
-            for row in reader:
-                question = row.get("question", "")
-                prices_raw = row.get("prices", "[]")
-                price_sum_raw = row.get("price_sum", "0")
-                spread_raw = row.get("spread", "0")
-
+        with open(file_path, newline="", encoding="utf-8") as file_handle:
+            for row in csv.DictReader(file_handle):
                 try:
-                    prices = [float(p) for p in json.loads(prices_raw)]
-                    price_sum = float(price_sum_raw)
-                    spread = float(spread_raw)
-                except (json.JSONDecodeError, TypeError, ValueError):
+                    prices = [float(p) for p in json.loads(row["prices"])]
+                    price_sum = float(row["price_sum"])
+                    spread = float(row["spread"])
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                     continue
-
-                log_key = (
-                    question,
-                    tuple(round(price, 6) for price in prices),
-                    round(price_sum, 6),
-                    round(spread, 6),
-                )
-                entries.add(log_key)
+                entries.add(_make_log_key(row.get("question", ""), prices, price_sum, spread))
     except OSError:
-        return entries
+        pass
 
     return entries
 
 
-logged_entries = load_logged_entries()
-print(f"Loaded {len(logged_entries)} prior opportunities from opportunities.csv")
-
-
-def log_opportunity(question, prices, price_sum, spread):
-    file_path = "opportunities.csv"
+def log_opportunity(opportunity: Opportunity, file_path: str = _LOG_PATH) -> None:
+    """Append one flagged market to CSV and write the header if needed."""
     file_exists = os.path.exists(file_path)
-
-    with open(file_path, mode="a", newline="", encoding="utf-8") as csv_file:
-        writer = csv.writer(csv_file)
-
+    with open(file_path, "a", newline="", encoding="utf-8") as file_handle:
+        writer = csv.writer(file_handle)
         if not file_exists:
             writer.writerow(["timestamp", "question", "prices", "price_sum", "spread"])
+        writer.writerow(
+            [
+                datetime.now(timezone.utc).isoformat(),
+                opportunity["question"],
+                json.dumps(opportunity["prices"]),
+                f"{opportunity['price_sum']:.6f}",
+                f"{opportunity['spread']:.6f}",
+            ]
+        )
 
-        writer.writerow([
-            datetime.utcnow().isoformat() + "Z",
-            question,
-            json.dumps(prices),
-            f"{price_sum:.6f}",
-            f"{spread:.6f}",
-        ])
 
-#Fetch Active Events
-def fetchActiveEvents():
-    url = "https://gamma-api.polymarket.com/events?active=true&closed=false&limit=100"
-    response = requests.get(url, timeout=15)
+def fetch_active_events() -> list[MarketJSON]:
+    """Fetch currently active events from the Polymarket API."""
+    response = requests.get(_API_URL, timeout=15)
     response.raise_for_status()
     data = response.json()
-    return data
-
-
-def displayData(data):
-    print("Market Data:")
-    newly_logged_count = 0
-    
-    # gamma-api returns list directly, clob-api returns {"data": [...]}
     if isinstance(data, list):
-        events = data
-    else:
-        events = data.get("data", data.get("markets", []))
-    
-    print(f"Found {len(events)} events\n")
-    
+        return [event for event in data if isinstance(event, dict)]
+    if isinstance(data, dict):
+        candidate = data.get("data", data.get("markets", []))
+        if isinstance(candidate, list):
+            return [event for event in candidate if isinstance(event, dict)]
+    return []
+
+
+def scan_once(logged: set[LogKey]) -> int:
+    """Process one API snapshot and return count of newly logged opportunities."""
+    events = fetch_active_events()
+    new_count = 0
+
     for event in events:
-        sub_markets = event.get('markets', [])
-        
-        for m in sub_markets:
-            question = m.get('question', '')
-            prices_raw = m.get('outcomePrices', [])
-            
-            # Parse and convert prices
-            try:
-                prices = [float(p) for p in json.loads(prices_raw) if p]
-            except (json.JSONDecodeError, TypeError, ValueError):
-                prices = []
-            
-            # Skip markets with incomplete price data
-            if len(prices) < 2:
+        markets = event.get("markets", [])
+        if not isinstance(markets, list):
+            continue
+
+        for market in markets:
+            if not isinstance(market, dict):
                 continue
-            
-            total = sum(prices)
-            
-            # Only print if mispriced
-            if abs(total - 1.0) > 0.02:
-                spread = max(prices) - min(prices)
-                log_key = (
-                    question,
-                    tuple(round(price, 6) for price in prices),
-                    round(total, 6),
-                    round(spread, 6),
+
+            question_value = market.get("question", "")
+            question = question_value if isinstance(question_value, str) else ""
+            prices = _parse_outcome_prices(market.get("outcomePrices", []))
+            if prices is None:
+                continue
+
+            opp = detect_opportunity(question, prices)
+            if opp is None:
+                continue
+
+            key = _make_log_key(opp["question"], opp["prices"], opp["price_sum"], opp["spread"])
+            if key not in logged:
+                log_opportunity(opp)
+                logged.add(key)
+                new_count += 1
+                print(f"[opportunity] {opp['question']}")
+                print(
+                    "    prices="
+                    f"{opp['prices']}  sum={opp['price_sum']:.6f}  spread={opp['spread']:.6f}"
                 )
 
-                if log_key not in logged_entries:
-                    log_opportunity(question, prices, total, spread)
-                    logged_entries.add(log_key)
-                    newly_logged_count += 1
+    return new_count
 
-                print(f"⚠️ {question}")
-                print(f"   Prices: {prices} sum={total:.3f}")
 
-    return newly_logged_count
+def main() -> None:
+    """Run the scanner loop until interrupted."""
+    logged = load_logged_entries()
+    print(f"Loaded {len(logged)} prior opportunities from {_LOG_PATH}")
 
-def main():
     while True:
         try:
-            data = fetchActiveEvents()
-            newly_logged_count = displayData(data)
-            print(f"New opportunities logged this cycle: {newly_logged_count}")
-        except requests.RequestException as error:
-            print(f"Request error: {error}")
+            n = scan_once(logged)
+            print(f"New opportunities this cycle: {n}")
+        except requests.RequestException as exc:
+            print(f"Request error: {exc}")
 
-        print("waiting 30s...")
-        time.sleep(30)
+        print(f"Waiting {_POLL_PERIOD}s...")
+        time.sleep(_POLL_PERIOD)
 
 
 if __name__ == "__main__":
     main()
-
-
