@@ -1,1 +1,1 @@
-"""Tests for Polymarket project."""
+"""Test package for the Polymarket mispricing scanner."""
