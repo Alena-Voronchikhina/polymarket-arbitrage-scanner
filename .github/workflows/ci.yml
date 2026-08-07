@@ -2,11 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 jobs:
-  test:
+  python:
+    name: Python lint & test
     runs-on: ubuntu-latest
 
     steps:
@@ -23,5 +23,40 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run tests
+      - name: Ruff check
+        run: ruff check src tests
+
+      - name: Ruff format
+        run: ruff format --check src tests
+
+      - name: Mypy
+        run: mypy --strict src
+
+      - name: Pytest
         run: pytest -q
+
+  cpp:
+    name: C++ build & test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++
+
+      - name: Configure
+        working-directory: cpp
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=OFF
+
+      - name: Build
+        working-directory: cpp
+        run: cmake --build build --parallel
+
+      - name: Test
+        working-directory: cpp/build
+        run: ctest --output-on-failure
