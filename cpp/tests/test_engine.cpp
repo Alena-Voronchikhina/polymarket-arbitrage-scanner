@@ -10,7 +10,9 @@
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
+#include <vector>
 
 using namespace polymarket;
 
