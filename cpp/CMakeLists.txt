@@ -34,6 +34,8 @@ endif()
 add_library(arbitrage_core STATIC
     src/engine.cpp
 )
+# Required so the static archive can link into the pybind11 shared module.
+set_property(TARGET arbitrage_core PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_include_directories(arbitrage_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
