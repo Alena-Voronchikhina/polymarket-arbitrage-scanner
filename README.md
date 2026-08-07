@@ -4,6 +4,8 @@ A scanner that polls active Polymarket markets and flags potential mispricing.
 
 It reads event data, parses each market's outcome prices, and flags markets where the implied probabilities drift far enough from 1.0 to be worth a closer look.
 
+This is a **signal generator**, not an execution bot. It surfaces markets that deserve manual review.
+
 ## Detection Logic
 
 For each market with prices $p_1, p_2, ..., p_n$:
@@ -13,6 +15,7 @@ $$
 $$
 
 If this condition holds, the market is logged as an opportunity with:
+
 - `question`
 - `prices`
 - `price_sum`
@@ -20,9 +23,58 @@ If this condition holds, the market is logged as an opportunity with:
 
 The scanner deduplicates entries with a rounded key and appends new opportunities to `opportunities.csv`.
 
-This is a signal generator, not an execution bot. It helps surface markets that deserve manual review.
+## Architecture And Data Flow
 
-## How To Run
+Python owns I/O, parsing, persistence, and the poll loop. The optional C++ extension owns the threshold-sensitive pricing check (Kahan-compensated summation). If the extension is missing, the same check runs in pure Python.
+
+```mermaid
+flowchart LR
+    subgraph Inputs
+        API["Polymarket Gamma API<br/>GET /events?active=true"]
+        CSV_IN["opportunities.csv<br/>(prior keys)"]
+    end
+
+    subgraph PythonRuntime["Python runtime (src/main.py)"]
+        LOOP["scan loop<br/>every 30s"]
+        FETCH["fetch_active_events()"]
+        PARSE["_parse_outcome_prices()"]
+        DETECT["detect_opportunity()"]
+        DEDUPE["dedupe via LogKey"]
+        LOG["log_opportunity()"]
+    end
+
+    subgraph CppEngine["C++ pricing engine (optional)"]
+        BIND["arbitrage_engine<br/>pybind11 module"]
+        EVAL["ArbitrageEngine::evaluate()<br/>Kahan sum + threshold"]
+    end
+
+    subgraph Outputs
+        STDOUT["stdout<br/>[opportunity] lines"]
+        CSV_OUT["opportunities.csv<br/>append-only log"]
+    end
+
+    API --> FETCH
+    CSV_IN --> LOOP
+    LOOP --> FETCH --> PARSE --> DETECT
+    DETECT -->|extension present| BIND --> EVAL
+    DETECT -->|fallback| PY["_detect_mispricing_python()"]
+    EVAL --> DEDUPE
+    PY --> DEDUPE
+    DEDUPE --> LOG --> CSV_OUT
+    DEDUPE --> STDOUT
+    LOOP -->|sleep 30s| LOOP
+```
+
+### Scan-loop responsibilities
+
+| Stage | Owner | Input | Output |
+| --- | --- | --- | --- |
+| Fetch | Python | HTTP events payload | list of event dicts |
+| Parse | Python | `outcomePrices` (JSON string or list) | `list[float]` or skip |
+| Price check | C++ if loaded, else Python | question + prices | opportunity or `None` |
+| Persist | Python | new opportunity | CSV row + stdout line |
+
+## Sample CLI Run
 
 ### 1) Environment setup
 
@@ -40,21 +92,30 @@ python -m src.main
 
 The process is continuous (polls every 30 seconds). Stop with `Ctrl+C`.
 
-### Example runtime output
+### Example output (captured from a live run)
 
 ```text
 [backend] C++ module not found; using Python fallback.
 Loaded 0 prior opportunities from opportunities.csv
 New opportunities this cycle: 0
 Waiting 30s...
+New opportunities this cycle: 0
+Waiting 30s...
 ```
 
-When opportunities are found, output includes lines like:
+When a market crosses the threshold and has not been logged before, output includes lines like:
 
 ```text
-[opportunity] <market question>
-    prices=[...]  sum=1.050000  spread=0.150000
+[opportunity] Will candidate X win the primary?
+    prices=[0.62, 0.45]  sum=1.070000  spread=0.170000
 ```
+
+### How to read that output
+
+- `[backend] ...` tells you whether pricing ran in C++ or the Python fallback. Behavior is the same threshold rule either way; C++ uses Kahan summation for stabler totals near the cutoff.
+- `Loaded N prior opportunities...` means dedupe keys were restored from `opportunities.csv`, so repeats are not re-appended.
+- `New opportunities this cycle: N` is the count of **newly logged** markets in that poll, not the total number of active markets.
+- An `[opportunity]` block means `|sum(prices) - 1.0| > 0.02` for that market snapshot. It is a screen for manual review, not a trade instruction.
 
 ## Why I Added a C++ Backend
 
@@ -76,16 +137,38 @@ cp arbitrage_engine*.so ../../src/
 Then run `python -m src.main` again. On startup you should see:
 
 ```text
-[backend] C++ ArbitrageEngine loaded (Kahan summation active).
+[backend] C++ ArbitrageEngine loaded (Kahan-based check active).
 ```
 
-## Architecture At A Glance
+## Limitations And Risk Model
+
+This tool is intentionally narrow. Keep these constraints in mind when reading its output.
+
+### Practical limits
+
+- **Latency / staleness.** The scanner polls every 30 seconds over HTTP. By the time a row is printed, the book may already have moved. There is no websocket streaming and no co-located feed.
+- **Fees and costs.** Flagged spreads ignore trading fees, gas/bridge costs (if any), and slippage. A sum that looks attractive on raw outcome prices can disappear after costs.
+- **Partial fills and depth.** The check uses listed outcome prices only. It does not model available size, order-book depth, or partial fills.
+- **API reliability.** Gamma API responses can be slow, rate-limited, or shaped differently than expected. Network errors are logged and the loop continues; malformed `outcomePrices` values are skipped.
+- **Regulatory / Terms of Service.** Prediction-market access and automated tooling may be restricted by jurisdiction and by Polymarket's terms. This repository does not provide legal advice; operators are responsible for compliance.
+
+### What this tool does **not** claim to do
+
+- It does **not** place, cancel, or manage orders.
+- It does **not** guarantee risk-free or executable arbitrage.
+- It does **not** account for fees, inventory, or settlement risk.
+- It does **not** provide financial advice or a production trading system.
+
+Treat every opportunity as a candidate for human inspection.
+
+## Project Layout
 
 - `src/main.py`: polling loop, API fetch, parsing, opportunity detection, CSV persistence.
 - `cpp/include/arbitrage/engine.hpp`: core engine interface.
 - `cpp/src/engine.cpp`: Kahan-based evaluation and batch scanning.
 - `cpp/src/bindings.cpp`: pybind11 bridge exposing C++ types to Python.
 - `cpp/tests/test_engine.cpp`: C++ unit tests for edge cases and threshold behavior.
+- `tests/`: Python unit tests (pricing core + parser edge cases).
 
 ## Development And Verification
 
@@ -101,7 +184,7 @@ python -m pytest
 ### C++ build and tests
 
 ```bash
-cd cpp/build
+mkdir -p cpp/build && cd cpp/build
 cmake .. -DCMAKE_BUILD_TYPE=Debug
 cmake --build . --parallel
 ctest --output-on-failure
@@ -114,13 +197,16 @@ cmake --build . --target format-check
 cmake --build . --target tidy-check
 ```
 
+CI (GitHub Actions) runs the Python suite and the C++ build/tests on every push and pull request.
+
 ## What This Project Demonstrates
 
 - Market-data ingestion and defensive parsing.
 - Threshold-based mispricing screening.
 - Deterministic deduplication and CSV persistence.
 - Python plus native C++ extension integration.
-- Strict linting, formatting, typing, and test gating.
+- Honest scope: screening signals, not automated trading.
+- Lint, typing, and unit-test gating for both language sides.
 
 ## License
 
