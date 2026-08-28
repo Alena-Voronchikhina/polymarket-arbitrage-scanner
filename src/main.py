@@ -1,16 +1,13 @@
-"""Poll Polymarket every 30 seconds for potential mispricing.
+"""Poll one Polymarket API page for sum-to-one pricing deviations.
 
-If the C++ extension is available, this module uses it for the pricing check.
-If not, it falls back to pure Python.
-
-Build the extension with:
-  cd cpp/build && cmake .. -DCMAKE_BUILD_TYPE=Release && cmake --build . --parallel
-  cp arbitrage_engine*.so ../../src/
+The scanner records observations for manual research. It does not inspect an
+order book, model fees or depth, or place trades.
 """
 
 import csv
 import importlib
 import json
+import math
 import os
 import time
 from datetime import datetime, timezone
@@ -19,39 +16,41 @@ from typing import Any, Final, TypeAlias, TypedDict
 import requests
 
 
-class Opportunity(TypedDict):
-    """Fields recorded for one flagged market."""
+class PricingDeviation(TypedDict):
+    """Fields recorded for one flagged market snapshot."""
 
     question: str
     prices: list[float]
     price_sum: float
-    spread: float
+    sum_deviation: float
+    price_range: float
 
 
-LogKey: TypeAlias = tuple[str, tuple[float, ...], float, float]
+LogKey: TypeAlias = tuple[str, tuple[float, ...], float, float, float]
 MarketJSON: TypeAlias = dict[str, Any]
 
 
 _API_URL: Final[str] = "https://gamma-api.polymarket.com/events?active=true&closed=false&limit=100"
-_LOG_PATH: Final[str] = "opportunities.csv"
+_LOG_PATH: Final[str] = "pricing_deviations.csv"
 _POLL_PERIOD: Final[int] = 30
 _THRESHOLD: Final[float] = 0.02
+_COMPARISON_EPSILON: Final[float] = 1e-12
 
-_ae: Any = None
+_pe: Any = None
 _engine: Any = None
 _USE_CPP: bool = False
 
 try:
-    _ae = importlib.import_module("arbitrage_engine")
-    _engine = _ae.ArbitrageEngine(threshold=_THRESHOLD)
+    _pe = importlib.import_module("pricing_engine")
+    _engine = _pe.PricingEngine(threshold=_THRESHOLD)
     _USE_CPP = True
-    print("[backend] C++ ArbitrageEngine loaded (Kahan-based check active).")
-except ModuleNotFoundError:
-    print("[backend] C++ module not found; using Python fallback.")
+    print("[backend] C++ PricingEngine loaded (Kahan-based check active).")
+except (ImportError, OSError):
+    print("[backend] C++ module unavailable; using Python fallback.")
 
 
 def _parse_outcome_prices(raw_prices: Any) -> list[float] | None:
-    """Parse API outcome prices into a clean list of floats."""
+    """Parse a complete list of finite outcome prices in the range [0, 1]."""
     if isinstance(raw_prices, str):
         try:
             raw_values = json.loads(raw_prices)
@@ -67,59 +66,84 @@ def _parse_outcome_prices(raw_prices: Any) -> list[float] | None:
 
     parsed: list[float] = []
     for value in raw_values:
-        if not value:
-            continue
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
         try:
-            parsed.append(float(value))
+            price = float(value)
         except (TypeError, ValueError):
             return None
+        if not math.isfinite(price) or not 0.0 <= price <= 1.0:
+            return None
+        parsed.append(price)
     return parsed
 
 
-def _detect_mispricing_python(
-    question: str, prices: list[float], threshold: float = 0.02
-) -> Opportunity | None:
-    """Fallback mispricing check using Python sum()."""
-    if len(prices) < 2:
+def _kahan_sum(values: list[float]) -> float:
+    """Match the C++ backend's compensated summation path."""
+    total = 0.0
+    compensation = 0.0
+    for value in values:
+        corrected = value - compensation
+        updated = total + corrected
+        compensation = (updated - total) - corrected
+        total = updated
+    return total
+
+
+def _detect_pricing_deviation_python(
+    question: str, prices: list[float], threshold: float = _THRESHOLD
+) -> PricingDeviation | None:
+    """Return a sum-to-one deviation for already validated prices."""
+    if not math.isfinite(threshold) or not 0.0 < threshold < 1.0:
+        raise ValueError("threshold must be finite and in (0, 1)")
+    if len(prices) < 2 or any(
+        not math.isfinite(price) or not 0.0 <= price <= 1.0 for price in prices
+    ):
         return None
 
-    total = sum(prices)
-    if abs(total - 1.0) <= threshold:
+    total = _kahan_sum(prices)
+    sum_deviation = total - 1.0
+    if abs(sum_deviation) <= threshold + _COMPARISON_EPSILON:
         return None
 
     return {
         "question": question,
         "prices": prices,
         "price_sum": total,
-        "spread": max(prices) - min(prices),
+        "sum_deviation": sum_deviation,
+        "price_range": max(prices) - min(prices),
     }
 
 
-def detect_opportunity(question: str, prices: list[float]) -> Opportunity | None:
-    """Use C++ when available, otherwise run the Python fallback."""
+def detect_deviation(question: str, prices: list[float]) -> PricingDeviation | None:
+    """Use C++ when available, otherwise run the equivalent Python check."""
     if _USE_CPP:
-        market = _ae.Market(question, prices)
-        opp = _engine.evaluate(market)
-        if opp is None:
+        market = _pe.Market(question, prices)
+        deviation = _engine.evaluate(market)
+        if deviation is None:
             return None
 
         return {
-            "question": opp.question,
-            "prices": opp.prices,
-            "price_sum": opp.price_sum,
-            "spread": opp.spread,
+            "question": deviation.question,
+            "prices": deviation.prices,
+            "price_sum": deviation.price_sum,
+            "sum_deviation": deviation.sum_deviation,
+            "price_range": deviation.price_range,
         }
 
-    return _detect_mispricing_python(question, prices)
+    return _detect_pricing_deviation_python(question, prices)
 
 
-def _make_log_key(question: str, prices: list[float], price_sum: float, spread: float) -> LogKey:
+def _make_log_key(deviation: PricingDeviation) -> LogKey:
     """Build a rounded key for CSV deduplication."""
     return (
-        question,
-        tuple(round(p, 6) for p in prices),
-        round(price_sum, 6),
-        round(spread, 6),
+        deviation["question"],
+        tuple(round(price, 6) for price in deviation["prices"]),
+        round(deviation["price_sum"], 6),
+        round(deviation["sum_deviation"], 6),
+        round(deviation["price_range"], 6),
     )
 
 
@@ -133,38 +157,52 @@ def load_logged_entries(file_path: str = _LOG_PATH) -> set[LogKey]:
         with open(file_path, newline="", encoding="utf-8") as file_handle:
             for row in csv.DictReader(file_handle):
                 try:
-                    prices = [float(p) for p in json.loads(row["prices"])]
-                    price_sum = float(row["price_sum"])
-                    spread = float(row["spread"])
+                    deviation: PricingDeviation = {
+                        "question": row.get("question", ""),
+                        "prices": [float(price) for price in json.loads(row["prices"])],
+                        "price_sum": float(row["price_sum"]),
+                        "sum_deviation": float(row["sum_deviation"]),
+                        "price_range": float(row["price_range"]),
+                    }
                 except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                     continue
-                entries.add(_make_log_key(row.get("question", ""), prices, price_sum, spread))
+                entries.add(_make_log_key(deviation))
     except OSError:
         pass
 
     return entries
 
 
-def log_opportunity(opportunity: Opportunity, file_path: str = _LOG_PATH) -> None:
-    """Append one flagged market to CSV and write the header if needed."""
-    file_exists = os.path.exists(file_path)
+def log_deviation(deviation: PricingDeviation, file_path: str = _LOG_PATH) -> None:
+    """Append one flagged snapshot and write the header if needed."""
+    write_header = not os.path.exists(file_path) or os.path.getsize(file_path) == 0
     with open(file_path, "a", newline="", encoding="utf-8") as file_handle:
         writer = csv.writer(file_handle)
-        if not file_exists:
-            writer.writerow(["timestamp", "question", "prices", "price_sum", "spread"])
+        if write_header:
+            writer.writerow(
+                [
+                    "timestamp",
+                    "question",
+                    "prices",
+                    "price_sum",
+                    "sum_deviation",
+                    "price_range",
+                ]
+            )
         writer.writerow(
             [
                 datetime.now(timezone.utc).isoformat(),
-                opportunity["question"],
-                json.dumps(opportunity["prices"]),
-                f"{opportunity['price_sum']:.6f}",
-                f"{opportunity['spread']:.6f}",
+                deviation["question"],
+                json.dumps(deviation["prices"]),
+                f"{deviation['price_sum']:.6f}",
+                f"{deviation['sum_deviation']:.6f}",
+                f"{deviation['price_range']:.6f}",
             ]
         )
 
 
 def fetch_active_events() -> list[MarketJSON]:
-    """Fetch currently active events from the Polymarket API."""
+    """Fetch the first configured page of active events."""
     response = requests.get(_API_URL, timeout=15)
     response.raise_for_status()
     data = response.json()
@@ -178,7 +216,7 @@ def fetch_active_events() -> list[MarketJSON]:
 
 
 def scan_once(logged: set[LogKey]) -> int:
-    """Process one API snapshot and return count of newly logged opportunities."""
+    """Process one API snapshot and return the number of newly logged rows."""
     events = fetch_active_events()
     new_count = 0
 
@@ -197,19 +235,21 @@ def scan_once(logged: set[LogKey]) -> int:
             if prices is None:
                 continue
 
-            opp = detect_opportunity(question, prices)
-            if opp is None:
+            deviation = detect_deviation(question, prices)
+            if deviation is None:
                 continue
 
-            key = _make_log_key(opp["question"], opp["prices"], opp["price_sum"], opp["spread"])
+            key = _make_log_key(deviation)
             if key not in logged:
-                log_opportunity(opp)
+                log_deviation(deviation)
                 logged.add(key)
                 new_count += 1
-                print(f"[opportunity] {opp['question']}")
+                print(f"[pricing-deviation] {deviation['question']}")
                 print(
                     "    prices="
-                    f"{opp['prices']}  sum={opp['price_sum']:.6f}  spread={opp['spread']:.6f}"
+                    f"{deviation['prices']}  sum={deviation['price_sum']:.6f}  "
+                    f"sum_deviation={deviation['sum_deviation']:.6f}  "
+                    f"price_range={deviation['price_range']:.6f}"
                 )
 
     return new_count
@@ -218,12 +258,12 @@ def scan_once(logged: set[LogKey]) -> int:
 def main() -> None:
     """Run the scanner loop until interrupted."""
     logged = load_logged_entries()
-    print(f"Loaded {len(logged)} prior opportunities from {_LOG_PATH}")
+    print(f"Loaded {len(logged)} prior pricing deviations from {_LOG_PATH}")
 
     while True:
         try:
-            n = scan_once(logged)
-            print(f"New opportunities this cycle: {n}")
+            count = scan_once(logged)
+            print(f"New pricing deviations this cycle: {count}")
         except requests.RequestException as exc:
             print(f"Request error: {exc}")
 

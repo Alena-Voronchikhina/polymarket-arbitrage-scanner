@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
-project(polymarket_arbitrage_engine
+project(polymarket_pricing_engine
     VERSION     1.0.0
-    DESCRIPTION "C++ backend for Polymarket mispricing checks"
+    DESCRIPTION "C++ backend for Polymarket pricing-deviation checks"
     LANGUAGES   CXX
 )
 
@@ -31,10 +31,11 @@ if(ENABLE_SANITIZERS AND CMAKE_BUILD_TYPE STREQUAL "Debug")
 endif()
 
 # ── Core library (no direct Python dependency) ───────────────────────────────
-add_library(arbitrage_core STATIC
+add_library(pricing_core STATIC
     src/engine.cpp
 )
-target_include_directories(arbitrage_core PUBLIC
+set_property(TARGET pricing_core PROPERTY POSITION_INDEPENDENT_CODE ON)
+target_include_directories(pricing_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
 
@@ -48,16 +49,16 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(pybind11)
 
 # ── Python extension module ───────────────────────────────────────────────────
-pybind11_add_module(arbitrage_engine src/bindings.cpp)
-target_link_libraries(arbitrage_engine PRIVATE arbitrage_core)
+pybind11_add_module(pricing_engine src/bindings.cpp)
+target_link_libraries(pricing_engine PRIVATE pricing_core)
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 enable_testing()
 
 add_executable(test_engine tests/test_engine.cpp)
-target_link_libraries(test_engine PRIVATE arbitrage_core)
+target_link_libraries(test_engine PRIVATE pricing_core)
 
-add_test(NAME ArbitrageEngineTests COMMAND test_engine)
+add_test(NAME PricingEngineTests COMMAND test_engine)
 
 # Optional style/static analysis targets.
 find_program(CLANG_FORMAT_BIN clang-format)

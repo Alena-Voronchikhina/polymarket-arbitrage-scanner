@@ -1,127 +1,98 @@
-# Polymarket Arbitrage Scanner
+# Polymarket Pricing-Deviation Scanner
 
-A scanner that polls active Polymarket markets and flags potential mispricing.
+A Python polling tool with an optional C++20/pybind11 backend. It reads outcome
+price snapshots from the Polymarket Gamma API and records markets whose listed
+prices deviate from a sum of 1.0 by more than a configurable threshold.
 
-It reads event data, parses each market's outcome prices, and flags markets where the implied probabilities drift far enough from 1.0 to be worth a closer look.
+This is a research scanner, not an execution or arbitrage system.
 
-## Detection Logic
+## What it measures
 
-For each market with prices $p_1, p_2, ..., p_n$:
+For validated prices `p1 ... pn`, the default rule is:
 
-$$
-\left|\sum_{i=1}^{n} p_i - 1.0\right| > 0.02
-$$
+```text
+abs(sum(prices) - 1.0) > 0.02
+```
 
-If this condition holds, the market is logged as an opportunity with:
-- `question`
-- `prices`
-- `price_sum`
-- `spread` (`max(prices) - min(prices)`)
+Each recorded row contains:
 
-The scanner deduplicates entries with a rounded key and appends new opportunities to `opportunities.csv`.
+- `price_sum`: compensated sum of the outcome prices
+- `sum_deviation`: signed `price_sum - 1.0`
+- `price_range`: `max(prices) - min(prices)`
 
-This is a signal generator, not an execution bot. It helps surface markets that deserve manual review.
+`price_range` is descriptive. It is not a bid/ask spread or profit estimate.
 
-## How To Run
+## Data validation
 
-### 1) Environment setup
+The parser preserves numeric zero and rejects incomplete or malformed lists,
+booleans, non-numeric values, NaN/infinity, negative prices, and prices above 1.
+Both Python and C++ paths apply the same finite `[0, 1]` contract and require at
+least two outcomes.
+
+## Run
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-### 2) Run the scanner
-
-```bash
 python -m src.main
 ```
 
-The process is continuous (polls every 30 seconds). Stop with `Ctrl+C`.
+The process polls every 30 seconds and appends new observations to
+`pricing_deviations.csv`.
 
-### Example runtime output
+## Optional C++ backend
 
-```text
-[backend] C++ module not found; using Python fallback.
-Loaded 0 prior opportunities from opportunities.csv
-New opportunities this cycle: 0
-Waiting 30s...
-```
-
-When opportunities are found, output includes lines like:
-
-```text
-[opportunity] <market question>
-    prices=[...]  sum=1.050000  spread=0.150000
-```
-
-## Why I Added a C++ Backend
-
-This project started as a Python scanner that polls Polymarket and flags potential mispricing. Once the first version was working, I looked at which step most directly controls whether a market gets flagged. The threshold check stood out because it is the core decision point: when the total price is close to 1.0, small numerical differences can matter.
-
-That led me to dig deeper into floating-point summation and threshold comparisons. I learned that floating-point addition can accumulate rounding error, which matters when a decision depends on whether a total lands just above or below a threshold. To make that step more stable, I added a C++ backend for the pricing check and used Kahan-compensated summation.
-
-The project now combines Python and C++: Python handles API I/O and persistence, while C++ handles the threshold-sensitive pricing check.
-
-## Build And Use The C++ Extension
+Python owns HTTP I/O, parsing, deduplication, and CSV persistence. The C++20
+backend implements the same threshold check with Kahan-compensated summation and
+is exposed through pybind11. It is an integration and numerical-consistency
+exercise; this repository does not claim a measured speedup for the small price
+vectors involved.
 
 ```bash
-cd cpp/build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . --parallel
-cp arbitrage_engine*.so ../../src/
+cmake -S cpp -B cpp/build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build cpp/build-release --parallel
+PYTHONPATH=cpp/build-release python -m src.main
 ```
 
-Then run `python -m src.main` again. On startup you should see:
+On startup, the selected backend is printed.
 
-```text
-[backend] C++ ArbitrageEngine loaded (Kahan summation active).
-```
-
-## Architecture At A Glance
-
-- `src/main.py`: polling loop, API fetch, parsing, opportunity detection, CSV persistence.
-- `cpp/include/arbitrage/engine.hpp`: core engine interface.
-- `cpp/src/engine.cpp`: Kahan-based evaluation and batch scanning.
-- `cpp/src/bindings.cpp`: pybind11 bridge exposing C++ types to Python.
-- `cpp/tests/test_engine.cpp`: C++ unit tests for edge cases and threshold behavior.
-
-## Development And Verification
-
-### Python quality gates
+## Verify
 
 ```bash
 ruff check src tests
 ruff format --check src tests
 mypy --strict src
-python -m pytest
+pytest -q
+
+cmake -S cpp -B cpp/build-debug -DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=ON
+cmake --build cpp/build-debug --parallel
+ctest --test-dir cpp/build-debug --output-on-failure
 ```
 
-### C++ build and tests
+GitHub Actions runs the Python gates plus Debug/sanitizer and Release C++
+builds, CTest, and native-extension import checks.
 
-```bash
-cd cpp/build
-cmake .. -DCMAKE_BUILD_TYPE=Debug
-cmake --build . --parallel
-ctest --output-on-failure
-```
+## Scope and limitations
 
-### Optional C++ style/static-analysis targets
+- The current URL requests only the first page of up to 100 active events; the
+  scanner does not claim complete market coverage.
+- Polling is 30-second HTTP snapshotting, not websocket or order-book data.
+- The rule does not model bids/asks, depth, partial fills, fees, slippage,
+  inventory, settlement, latency, or whether short/sell legs are available.
+- A flagged row is a pricing-deviation observation for manual analysis, not an
+  executable trade, risk-free arbitrage, financial advice, or profitability
+  evidence.
+- API availability, response shape, access, and platform/jurisdiction rules can
+  change; operators are responsible for current compliance.
 
-```bash
-cmake --build . --target format-check
-cmake --build . --target tidy-check
-```
+## Project layout
 
-## What This Project Demonstrates
-
-- Market-data ingestion and defensive parsing.
-- Threshold-based mispricing screening.
-- Deterministic deduplication and CSV persistence.
-- Python plus native C++ extension integration.
-- Strict linting, formatting, typing, and test gating.
+- `src/main.py` — polling, validation, Python check, deduplication, CSV output
+- `cpp/` — C++20 engine, pybind11 module, and Release-safe CTest executable
+- `tests/` — parser, pricing, boundary, and CSV tests
+- `.github/workflows/ci.yml` — Python and C++ verification gates
 
 ## License
 
-MIT
+[MIT](LICENSE)
