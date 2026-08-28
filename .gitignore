@@ -41,6 +41,12 @@ htmlcov/
 .env
 .env.local
 
+# Scanner runtime output
+pricing_deviations.csv
+
+# C++ local build trees
+cpp/build*/
+
 # OS
 .DS_Store
 Thumbs.db

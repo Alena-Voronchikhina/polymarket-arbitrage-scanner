@@ -6,22 +6,52 @@ on:
   pull_request:
 
 jobs:
-  test:
+  python:
+    name: Python quality and tests
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: pip install -r requirements.txt
+      - run: ruff check src tests
+      - run: ruff format --check src tests
+      - run: mypy --strict src
+      - run: pytest -q
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Run tests
-        run: pytest -q
+  cpp:
+    name: C++ ${{ matrix.build_type }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - build_type: Debug
+            sanitizers: ON
+          - build_type: Release
+            sanitizers: OFF
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Configure
+        run: >-
+          cmake -S cpp -B cpp/build-${{ matrix.build_type }}
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DENABLE_SANITIZERS=${{ matrix.sanitizers }}
+      - name: Build core, extension, and tests
+        run: cmake --build cpp/build-${{ matrix.build_type }} --parallel
+      - name: Run C++ tests
+        run: ctest --test-dir cpp/build-${{ matrix.build_type }} --output-on-failure
+      - name: Import native extension
+        if: matrix.build_type == 'Release'
+        run: >-
+          PYTHONPATH=cpp/build-${{ matrix.build_type }} python -c
+          "import pricing_engine as pe;
+          engine = pe.PricingEngine();
+          assert engine.threshold == 0.02;
+          assert engine.evaluate(pe.Market('Balanced', [0.5, 0.5])) is None;
+          assert engine.evaluate(pe.Market('Deviation', [0.6, 0.5])) is not None"
